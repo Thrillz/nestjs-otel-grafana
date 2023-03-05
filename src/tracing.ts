@@ -1,47 +1,51 @@
 import {
+  ConsoleSpanExporter,
   BatchSpanProcessor,
   SimpleSpanProcessor,
+  NoopSpanProcessor
 } from '@opentelemetry/sdk-trace-base';
-import { api, NodeSDK } from '@opentelemetry/sdk-node';
+import { metrics, NodeSDK } from '@opentelemetry/sdk-node';
 import * as process from 'process';
 import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
 import { ExpressInstrumentation } from '@opentelemetry/instrumentation-express';
 import { NestInstrumentation } from '@opentelemetry/instrumentation-nestjs-core';
-import { JaegerExporter } from '@opentelemetry/exporter-jaeger';
 import { Resource } from '@opentelemetry/resources';
 import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { JaegerExporter } from '@opentelemetry/exporter-jaeger';
+// Don't forget to import the dotenv package!
 import * as dotenv from 'dotenv';
-import { B3Propagator } from '@opentelemetry/propagator-b3';
+import { diag, DiagConsoleLogger, DiagLogLevel } from '@opentelemetry/api'
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
+import { PrometheusExporter } from '@opentelemetry/exporter-prometheus';
+import { ExplicitBucketHistogramAggregation, InstrumentType, MeterProvider, View } from '@opentelemetry/sdk-metrics';
+import { HostMetrics } from '@opentelemetry/host-metrics';
 
-dotenv.config();
+
+dotenv.config()
+
+diag.setLogger(new DiagConsoleLogger(), DiagLogLevel.WARN)
+
+const consoleSpanExporter = new ConsoleSpanExporter();
 
 const jaegerExporter = new JaegerExporter({
   endpoint: 'http://localhost:14268/api/traces',
 });
 
-const oltpExporter = new OTLPTraceExporter({
-  url: `https://api.honeycomb.io/v1/traces`,
-  headers: {
-    'x-honeycomb-team': process.env.HONEYCOMB_API_KEY,
-  },
-});
+const traceExporter = jaegerExporter;
 
-const traceExporter =
-  process.env.NODE_ENV === `development` ? jaegerExporter : oltpExporter;
+const spanProcessor = new BatchSpanProcessor(traceExporter);
 
-const spanProcessor =
-  process.env.NODE_ENV === `development`
-    ? new SimpleSpanProcessor(traceExporter)
-    : new BatchSpanProcessor(traceExporter);
+const noopProcessor = new NoopSpanProcessor()
 
-api.propagation.setGlobalPropagator(new B3Propagator());
+const exporter = new OTLPTraceExporter({
+  url: undefined
+})
 
 export const otelSDK = new NodeSDK({
   resource: new Resource({
     [SemanticResourceAttributes.SERVICE_NAME]: `nestjs-otel`,
   }),
-  spanProcessor,
+  spanProcessor: spanProcessor,//process.env.NODE_ENV === `development` ? noopProcessor : spanProcessor,
   instrumentations: [
     new HttpInstrumentation(),
     new ExpressInstrumentation(),
@@ -49,13 +53,47 @@ export const otelSDK = new NodeSDK({
   ],
 });
 
+const histogramView = new metrics.View({
+  aggregation: new metrics.ExplicitBucketHistogramAggregation([0.1, 0.3, 0.5, 0.7, 1, 3, 5, 7, 10]),
+  instrumentName: '*',
+  instrumentType: metrics.InstrumentType.HISTOGRAM
+})
+
+// otelSDK.configureMeterProvider({
+//   reader: new PrometheusExporter({
+//     endpoint: 'metrics'
+//   }),
+//   views: [histogramView]
+// })
+
+const meterProvider = new MeterProvider({
+  views: [
+    new View({
+      instrumentName: '*',
+      instrumentType: InstrumentType.HISTOGRAM,
+      aggregation: new ExplicitBucketHistogramAggregation([0.001, 0.01, 0.1, 1, 2, 5])
+    })
+  ]
+})
+const promexporter = new PrometheusExporter({
+  endpoint: 'metrics',
+})
+meterProvider.addMetricReader(promexporter)
+
+require('opentelemetry-node-metrics')(meterProvider)
+const hostMetrics = new HostMetrics({ meterProvider, name: 'example-host-metrics' });
+hostMetrics.start();
+
+
+
+
 // gracefully shut down the SDK on process exit
 process.on('SIGTERM', () => {
   otelSDK
     .shutdown()
     .then(
-      () => console.log('SDK shut down successfully'),
-      (err) => console.log('Error shutting down SDK', err),
+      () => diag.info('SDK shut down successfully'),
+      (err) => diag.error('Error shutting down SDK', err),
     )
     .finally(() => process.exit(0));
 });
